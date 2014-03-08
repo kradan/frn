@@ -6,9 +6,12 @@ use Getopt::Long;
 use File::HomeDir;
 use File::Basename;
 use WWW::Curl::Easy;
+use IO::Handle;
+STDOUT->autoflush(1);
+
+{
 
 # parse options & load config
-$|=1;
 my %config;
 my $self = \%config;
 Getopt::Long::Configure('bundling');
@@ -25,16 +28,20 @@ update_index() || die "Could not find out last entry.\n";
 fetch_all($config{'last'}); # TODO evaluate return value
 exit 0;
 
+}
+
 ## subs
-sub debug { print shift if ($config{debug}); }
+sub debug { if ($config{debug}) { print shift } }
 sub help {
   # TODO use help interface of Getopt::Modular (https://metacpan.org/pod/release/DMCBRIDE/Getopt-Modular-0.13/lib/Getopt/Modular.pm)
-  print "This script downloads index and files from freie-radios.net, german political audio news. If called without arguments it only downloads index + info pages.
+  print <<"EOF";
+This script downloads index and files from freie-radios.net, german political audio news. If called without arguments it only downloads index + info pages.
 \t-a -all mp3\tload all mp3 files
 \t-d -debug debug\tshows all connection status messages
 \t-p -play play\tplays downloaded files
 \t-n -news news\tstarts playing with youngest entries
-\t-h -help help\tshow this help\n";
+\t-h -help help\tshow this help
+EOF
   exit;
 }
 sub do_config {
@@ -69,8 +76,8 @@ sub check_config {
 
   # read config
   open my $fh, '<', "$config{dir}/config" or die "Could not open '$config{dir}/config': $!\n";
-  foreach (<$fh>) { 
-    if (/^(.+)=(.+)$/) {
+  while (my $line = <$fh>) { 
+    if ($line =~ /^(.+)=(.+)$/) {
       $config{$1} = $2;
     }
   } close $fh;
@@ -82,14 +89,19 @@ sub check_config {
       mkdir "$config{datadir}/$_" or die "Failed to create '$config{datadir}/$_': $!\n";
     }
   }
+  return 1;
 }
 
 sub show_config {
-  map { print "$_:\t". (($self->{$_}) ? $self->{$_} : 'undef') ."\n"; } qw/debug play mp3 url dir datadir/;
+  foreach (qw/debug play mp3 url dir datadir/) {
+    print "$_:\t". (($self->{$_}) ? $self->{$_} : 'undef') ."\n";
+  }
+  return;
 }
 
 sub search {
   # TODO search for strings in database
+  return;
 }
 
 sub play_all {
@@ -110,6 +122,7 @@ sub play_mp3 {
   print "\rPlaying $mp3 ";
   system "mplayer -really-quiet $mp3 2>/dev/null"; print "\n";
   sleep 1; # give the user a chance to CTRL+C or read the filename if mplayer has issues
+  return 1;
 }
 
 sub update_index {
@@ -120,8 +133,8 @@ sub update_index {
 
   # load index.html
   open my $fh, '<', $config{'index'} or warn "Could not load '$config{'index'}': $!\n" and return;
-  foreach (<$fh>) {
-    if (/class="btitel"><a href="\/(\d+)">/) {
+  while (my $line = <$fh>) {
+    if ($line =~ /class="btitel"><a href="\/(\d+)">/) {
       print "\rLatest entry: $1\n";
       close $fh;
       $config{'last'} = $1;
@@ -168,6 +181,7 @@ sub fetch {
   } while ($try <=5);
 
   if ($try >=5) { print "Giving up for '$url'.\n"; }
+  return;
 }
 
 sub save {
@@ -177,6 +191,7 @@ sub save {
   open my $fh, '>', $fn or die "could not write to '$fn': $!\n";
   print $fh @data;
   close $fh;
+  return 1;
 }
 
 sub parse {
@@ -224,8 +239,9 @@ sub fetch_all { # retrieve html + mp3
   } else { warn "\rCould not open 'failed': $!\n"; }
 
   # start downloads
+  ENTRIES:
   while ($entry >0) {
-    if ($config{noentry}{$entry}) { $entry--; next; } # is handy if html cache got lost
+    if ($config{noentry}{$entry}) { $entry--; next ENTRIES; } # is handy if html cache got lost
 
     print "\r$entry ";
     my $htmlfile = "html/$entry.html";
@@ -246,10 +262,11 @@ sub fetch_all { # retrieve html + mp3
     } $entry--;
   }
 
-  print "\rSeemes as we downloaded all entries.\n"; 1;
+  print "\rSeemes as we downloaded all entries.\n"; 
+  return 1;
 }
 __END__
-# Thanks #perl for the good hints!
+# Thanks #perl for the hints!
 # 0. http://perl-begin.org/tutorials/bad-elements/
 # 1. FIXED if code needs to be read bottom up, it may improve from a re-arrangement
 # 2. you need more empty lines. some of the lines are too long. there should be some empty lines inside subroutines too. separating paragraphs.
