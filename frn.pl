@@ -1,26 +1,34 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-use LWP::Simple;
-use LWP::UserAgent;
-use 5.12.1;
-use HTTP::Request::Common;
-use HTTP::Thin;
-use subs qw/debug help parse_options do_config check_config play_all play update_index fetch_all fetch save parse noentry/;
 
-## vars
-my %config = (url => "http://freie-radios.net", ua => LWP::UserAgent->new);
-$config{ua}->timeout(60); # failed try to reduce LWP CPU consumption.
-$config{ua}->add_handler( response_header => sub { 
-	my($response, $ua, $h) = @_;
-        my $size = $response->{'_headers'}{'content-length'};
-        debug "size=$size " if ($size);
-        $h->cancel; # we only this request to find out file size
-	} );
+use Getopt::Long;
+use File::HomeDir;
+use File::Basename;
+use WWW::Curl::Easy;
+
+# parse options & load config
 $|=1;
+my %config;
+my $self = \%config;
+Getopt::Long::Configure('bundling');
+GetOptions('mp3|a|all' => \$self->{mp3}, 'debug|d|v' => \$self->{debug}, 'p|play' => \$self->{play}, 'n|news:2' => \$self->{play},
+		'search|s=s@' => \&search, 'help|h|?' => \&help);
+check_config();
+show_config() if ($config{debug});
+
+## main
+play_all() if ($config{play});
+
+# if called without arguments we only download index + info pages
+update_index() || die "Could not find out last entry.\n";
+fetch_all($config{'last'}); # TODO evaluate return value
+exit 0;
 
 ## subs
+sub debug { print shift if ($config{debug}); }
 sub help {
+  # TODO use help interface of Getopt::Modular (https://metacpan.org/pod/release/DMCBRIDE/Getopt-Modular-0.13/lib/Getopt/Modular.pm)
   print "This script downloads index and files from freie-radios.net, german political audio news. If called without arguments it only downloads index + info pages.
 \t-a -all mp3\tload all mp3 files
 \t-d -debug debug\tshows all connection status messages
@@ -29,22 +37,10 @@ sub help {
 \t-h -help help\tshow this help\n";
   exit;
 }
-sub debug { print shift if ($config{debug}); }
-sub parse_options {
-  foreach (@_) { # if called without arguments we only download index + info pages
-    # TODO implement parsing for -and to verbosely download audio files and immedidately play them
-    if (/-a|-all|mp3/) { $config{mp3}++; } # load all mp3 files
-    elsif (/-d|-debug|debug/) { $config{debug}++; } # shows all connection status messages
-    elsif (/-n|-news|news/) { $config{play}++; $config{news}++; } # starts playing with youngest entries
-    elsif (/-p|-play|play/) { $config{play}++; }
-    elsif (/-h|-help|help/) { &help; }
-    elsif (/(\d+)/) { push(@{$config{search}}, $1); } # TODO search for strings in database
-  }
-}
 sub do_config {
   $config{'datadir'} ||= '';
   do {
-    print "Where should mp3 and html be files saved? Leave empty to store it in $config{'dir'} [$config{'datadir'}] ";
+    print "Where to save mp3 and html files? Leave empty to store it in $config{'dir'} [$config{'data'}] ";
     chomp(my $datadir = <STDIN>);
     unless ($datadir) { $config{'datadir'} = $config{'dir'}; }
     elsif (! -d $datadir) {
@@ -52,98 +48,144 @@ sub do_config {
       else { warn "Could not create '$datadir': $!\n"; }
     }
   } until ($config{'datadir'});
-  open my $fh, '>', "$config{dir}/config" or die "Could not save '$config{dir}/config': $!\n";
-  print $fh "datadir=$config{datadir}\n";
+  open my $fh, '>', "$config{'dir'}/config" or die "Could not save '$config{'dir'}/config': $!\n";
+  print $fh "datadir=$config{'datadir'}\n";
   close $fh;
   return 1;
 }
+
 sub check_config {
-  $config{'dir'} ||= "$ENV{'HOME'}/.frn";
-  $config{'index'} ||= 'index.html'; # TODO publish this option in the config/manual
-  mkdir $config{'dir'} unless (-d $config{'dir'}); # create config dir
-  chdir "$config{dir}" || die "chdir $config{dir}: $!\n"; # access it or die
-  &do_config or die "Could not create config.\n" unless (-f 'config'); # create new config if necessary
+  # set default options - TODO publish in the README
+  $config{'dir'} ||= home().'/.frn';
+  $config{'url'} = "http://www.freie-radios.net";
+  $config{'index'} ||= 'index.html';
+
+  # config dif
+  mkdir $config{'dir'} unless (-d $config{'dir'});
+
+  unless (-f "$config{'dir'}/config") { # create new config if necessary
+    do_config or die "Could not create '$config{'dir'}/config'.\n";
+  }
+
+  # read config
   open my $fh, '<', "$config{dir}/config" or die "Could not open '$config{dir}/config': $!\n";
-  foreach (<$fh>) { # read config
+  foreach (<$fh>) { 
     if (/^(.+)=(.+)$/) {
       $config{$1} = $2;
     }
   } close $fh;
+
   # prepare datadir
-  mkdir $config{datadir} unless (-d $config{datadir}); 
-  chdir $config{datadir} or die "Could not access '$config{datadir}': $!\n";
-  mkdir "html" unless (-d 'html');
-  mkdir "mp3" unless (-d 'mp3');
-  return 1;
+  mkdir $config{datadir} unless (-d $config{datadir});
+  foreach (qw/html mp3/) {
+    unless (-d "$config{datadir}/$_") {
+      mkdir "$config{datadir}/$_" or die "Failed to create '$config{datadir}/$_': $!\n";
+    }
+  }
 }
+
+sub show_config {
+  map { print "$_:\t". (($self->{$_}) ? $self->{$_} : 'undef') ."\n"; } qw/debug play mp3 url dir datadir/;
+}
+
+sub search {
+  # TODO search for strings in database
+}
+
 sub play_all {
   # TODO search & grep
-  if ($config{news}) { # start with youngest
-    my @list = qx{ls -1 --sort time mp3/*.mp3 };
-    exit unless (@list >0);
-    map { chomp; play($_) if (/\.mp3$/); } @list;
-  } else {
-    map { play($_) } glob('mp3/*');
+  my $dir = "$config{'datadir'}/mp3";
+  die "Could not find '$dir'.\n" unless (-d $dir);
+  my @list = ($config{news}) ? qx{ls -1 --sort time $dir/*.mp3} : glob("$dir/*.mp3");
+  foreach (@list) {
+    chomp();
+    if (/\/(\d+-\w+-\d+\.mp3)$/) { play_mp3($_); }
+    else { debug("Bad scheme: $_\n"); }
   }
   exit;
 }
-sub play {
-  my $mp3 = shift || warn "play(): no file given.\n" and return;
-  print "\rPlaying $mp3.. ";
-  system "mplayer -really-quiet $mp3 2>/dev/null";
+
+sub play_mp3 {
+  my $mp3 = shift;# || warn "play_mp3(): no file given.\n" and return;
+  print "\rPlaying $mp3 ";
+  system "mplayer -really-quiet $mp3 2>/dev/null"; print "\n";
   sleep 1; # give the user a chance to CTRL+C or read the filename if mplayer has issues
 }
+
 sub update_index {
-  #unless (-f $config{index}) { # TODO check only if age > 1d?
-    print "Fetching index..";
-    save(fetch($config{url}), 'index.html');
+  #unless (-f $config{index}) { # TODO fetch only if age > 1d?
+    print "Refreshing index ";
+    fetch($config{'url'}, $config{'index'});
   #}
+
   # load index.html
   open my $fh, '<', $config{'index'} or warn "Could not load '$config{'index'}': $!\n" and return;
   foreach (<$fh>) {
     if (/class="btitel"><a href="\/(\d+)">/) {
-      print "\rLast entry: $1\n";
+      print "\rLatest entry: $1\n";
       close $fh;
       $config{'last'} = $1;
       return 1;
     }
   } close $fh;
+  die "Could not find latest entry in $config{'index'}.\n";
 }
+
 sub fetch {
-  my $url = shift||die "fetch(): no url supplied.\n";
-  my ($err, $res);
+  my ($url, $fn) = @_;
+  defined($url) or die "fetch(): no url supplied.\n";
+
+  my ($try);
   do {
-    debug "\rLoading $url.. [LWP] ";
-    my $req = HTTP::Request->new(GET => $url);
-    $res = $config{ua}->request($req); # will output size and cancel (see above)
-    debug "[Thin] ";
-    $res = HTTP::Thin->new()->request(GET $url);
-    unless ($res->is_success) { $err++;
-      my $msg = $res->status_line;
-      print "[$err] $msg ";
-      if ($msg =~ /^599/) { print $res->content; }
-      sleep 10;
-    } else { debug "done.\n"; }
-    sleep 1; # give user a chance to cancel when interface disappeared etc.
-  } until ($res->is_success || $err >=5);
-  if ($err >=5) { print "Giving up for '$url'.\n"; }
-  $res;
+
+    debug "[Curl] ";
+    my $curl = WWW::Curl::Easy->new;
+    $curl->setopt(CURLOPT_HEADER,1);
+    $curl->setopt(CURLOPT_URL, $url);
+
+    # A filehandle, reference to a scalar or reference to a typeglob can be used here.
+    my $response;
+    $curl->setopt(CURLOPT_WRITEDATA,\$response);
+
+    # Starts the actual request
+    my $retcode = $curl->perform;
+
+    # Looking at the results...
+    if ($retcode == 0) {
+
+      #my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
+      debug("ok.\n");
+
+      if ($fn) { return save($fn, $response); }
+      else { return $response; }
+
+    } else {
+      # Error code, type of error, error message
+      print("[$try] $retcode ".$curl->strerror($retcode)." ".$curl->errbuf."\n");
+    }
+
+    sleep 1; # give user a chance to cancel when network interface disappeared etc.
+  } while ($try <=5);
+
+  if ($try >=5) { print "Giving up for '$url'.\n"; }
 }
+
 sub save {
-  my $res = shift|| die "save(): called with resource.\n";
-  my $file = shift||return; # silently return because of possible failed download
-  return unless ($res->is_success);
-  open my $fh, "> $file" or die "could not write to '$file': $!\n";
-  print $fh $res->as_string;
+  my ($fn, @data) = @_;
+  return unless (defined($fn));
+
+  open my $fh, '>', $fn or die "could not write to '$fn': $!\n";
+  print $fh @data;
   close $fh;
-  return 1;
 }
+
 sub parse {
-  my $file = shift||die "parse(): no file given\n";
+  my $file = shift or die "parse(): no or empty filename given\n";
   open my $fh, '<', $file or warn "Could not read '$file': $!\n" and return;
   my @urls;
+
   foreach (<$fh>) {
-    if (/Beitrag nicht gefunden./ && $file =~ /(\d+)\.html/) { &noentry($1); return; }
+    if (/Beitrag nicht gefunden./ && $file =~ /(\d+)\.html/) { noentry($1); return; }
     elsif (/<a href="(.+\.mp3)">Download<\/a>/) {
       my $url = $1;
       debug "Found mp3: $1.\n";
@@ -158,51 +200,66 @@ sub parse {
   } close $fh;
   return @urls;
 }
+
 sub noentry {
-  # we save the number of parsed html files in 'noentry' when they contain no entry
-  # if this file is deleted, all cached html are reparsed on the next run
-  # if also the html cache has been deleted, we need to redownload all index files again
-  # TODO create db file with titles and mp3 urls
+  # We save the number of parsed html files in 'noentry' when they contain no entry.
+  # If this file is deleted, all cached html files are reparsed on the next run.
+  # If also the html cache has been deleted, we need to redownload all index files again.
+  # TODO create db file with titles, descriptions and mp3 urls.
   my $id = shift or warn "failed(): no id given\n" and return;
+  return unless ($id =~ /(\d+)/);
   open my $fh, '>> noentry' or die "Could not write to 'noentry': $!\n";
-  print $fh "$id\n";
+  print $fh "$1\n";
   close $fh;
   return 1;
 }
+
 sub fetch_all { # retrieve html + mp3
-  my $entry = shift || $config{'last'};
+  my $entry = shift // $config{'last'};
+
   # load list of known ids that contain no entry
-  if (open my $missing, "< noentry") { 
-    map { $config{noentry}{$1}++ if (/(\d+)/) } <$missing>;
+  if (open my $missing, '< noentry') { 
+    /(\d+)/ && $config{noentry}{$1}++ while <$missing>; # thanks to tm604!
     close $missing;
-  } else { warn "Could not open 'failed': $!\n"; }
+  } else { warn "\rCould not open 'failed': $!\n"; }
+
   # start downloads
   while ($entry >0) {
     if ($config{noentry}{$entry}) { $entry--; next; } # is handy if html cache got lost
-    printf "\r%80s\r$entry.html ", '';
+
+    print "\r$entry ";
     my $htmlfile = "html/$entry.html";
-    save(fetch("$config{url}/$entry") , $htmlfile) unless (-f $htmlfile);
+    # TODO try to run multiple downloads in parallel
+    fetch("$config{url}/$entry" , $htmlfile) unless (-f $htmlfile);
+
     if ($config{mp3}) { # should we download mp3 files also?
       foreach my $url (parse($htmlfile)) {
-        chomp(my $file = qx{basename $url});
+        my $fn = basename($url);
         # TODO check if the file is only partially downloaded
-        unless (-f "mp3/$file") {
-          print "$url > $file ";
-          save(fetch($url), "mp3/$file");
+        unless (-f "mp3/$fn") {
+          print "$url > $fn ";
+          fetch($url, "mp3/$fn");
           print "\n";
           sleep 1;
         }
       }
     } $entry--;
-  } print "\rSeemes as we downloaded all entries.\n";
-  return 1; # TODO evaluate return value
-}
-#end subs
+  }
 
-## main
-&parse_options(@ARGV);
-&check_config;
-&play_all if ($config{play});
-&update_index || die "Could not find out last entry.\n";
-&fetch_all($config{'last'}); # TODO try to run multiple downloads in parallel
-exit;
+  print "\rSeemes as we downloaded all entries.\n"; 1;
+}
+__END__
+# Thanks #perl for the good hints!
+# 0. http://perl-begin.org/tutorials/bad-elements/
+# 1. FIXED if code needs to be read bottom up, it may improve from a re-arrangement
+# 2. you need more empty lines. some of the lines are too long. there should be some empty lines inside subroutines too. separating paragraphs.
+# 3. FIXED don't call subs with &. pretty sure everyone agrees that 'use subs' is obsolete, and call subs without &. you don't need use subs either. it actually does nothing if you always call subs with parenthesis. composing into subs is fine, even if they're each called just once. if there's an obvious partial problem that can be solved independently, that's a strong invitation to make it a reasonably named sub
+# 4. FIXED you have a global %config variable. Maybe you want a class. that's not needed and I'm sure he doesn't want a class for such a script. the "ua" does not belong in %config. mst: I tend to use methods on an object so the config is in $self
+# 5. FIXED sub parse_options ==> this should be done using Getopt::Long
+# 6. FIXED how much do you trust these MP3s? you're trusting that they aren't named `rm -rf ~`, for a start
+# 7. FIXED might also want to fix those 2-arg opens and the map-with-side-effects. for the latter, I'd suggest something like /(\d+)/ && $config{noentry}{$1}++ while <$missing>; perhaps
+# 8. FIXED you don't need line 83, the maps on lines 84+86 should be for loops instead
+# 9. FIXED if you're working with config/data paths, there's a few modules which may help - File::HomeDir, for example (same for reading/saving config files)
+# 10. FIXED also Perl has File::Basename, no need to get the shell to do it for you
+# 11. FIXED it's not a good idea to chdir
+# 12. FIXED plus that HTTP::Thin / LWP::UserAgent / LWP::Simple trifecta of HTTP modules may cause a raised eyebrow for the next person to be maintaining this code
