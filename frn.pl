@@ -3,47 +3,108 @@ use strict;
 use warnings;
 
 use Getopt::Long;
-use File::HomeDir;
 use File::Basename;
+use File::Glob ':glob';
+use File::HomeDir;
 use WWW::Curl::Easy;
+use HTML::TokeParser::Simple;
+use HTML::TreeBuilder::XPath;
+use Try::Tiny;
+use MP3::Info;
 use IO::Handle;
 STDOUT->autoflush(1);
 
-{
-
-# parse options & load config
+# OPTIMIZE global container
 my %config;
 my $self = \%config;
+
+# parse options
 Getopt::Long::Configure('bundling');
-GetOptions('mp3|a|all' => \$self->{mp3}, 'debug|d|v' => \$self->{debug}, 'p|play' => \$self->{play}, 'n|news:2' => \$self->{play},
-		'search|s=s@' => \&search, 'help|h|?' => \&help);
-check_config();
-show_config() if ($config{debug});
+GetOptions(
+	'a|all|mp3' => \$self->{'mp3'},
+	'i|index:0' => \$self->{'mp3'},
+	'p|play:1' => \$self->{'play'},
+	'n|news:2' => \$self->{'play'},
+	's|search=s@' => \&search, # TODO
+	'o|offline' => \$self->{'offline'},
+	'd|debug|v' => \$self->{'debug'},
+	'h|help|?' => \&help
+);
 
-## main
-play_all() if ($config{play});
-
-# if called without arguments we only download index + info pages
-update_index() || die "Could not find out last entry.\n";
-fetch_all($config{'last'}); # TODO evaluate return value
-exit 0;
-
-}
-
-## subs
-sub debug { if ($config{debug}) { print shift } }
 sub help {
   # TODO use help interface of Getopt::Modular (https://metacpan.org/pod/release/DMCBRIDE/Getopt-Modular-0.13/lib/Getopt/Modular.pm)
   print <<"EOF";
 This script downloads index and files from freie-radios.net, german political audio news. If called without arguments it only downloads index + info pages.
-\t-a -all mp3\tload all mp3 files
-\t-d -debug debug\tshows all connection status messages
-\t-p -play play\tplays downloaded files
-\t-n -news news\tstarts playing with youngest entries
-\t-h -help help\tshow this help
+\t-a --all --mp3\tdownload mp3 files without playing
+\t-p --play play\tplay downloaded files without updating
+\t-n --news\tupdate index and play youngest entry after downloading
+\t-i --index\tonly download index and entry descriptions (default behaviour)
+\t-d --debug\tshow all connection status messages
+\t-o --offline\toffline mode - no downloading
+\t-h --help\tshow this help
 EOF
   exit;
 }
+
+# parse additional arguments
+while(my $arg = shift) {
+  # < http://perl-begin.org/tutorials/bad-elements/
+  # Some people use "^" and "$" in regular expressions to mean beginning-of-the-string or end-of-the-string.
+  # However, they can mean beginning-of-a-line and end-of-a-line respectively using the /m flag which is confusing.
+  # It's a good idea to use \A for start-of-string and \z for end-of-string always,
+  # and to specify the /m flag if one needs to use "^" and "$" for start/end of a line.
+  # \z is the end of the string always. \Z can be the end with an optional trailing newline removed.
+  # <mst> damian conway really prefers \A and \Z but damian does such freaking crazy things with regexps
+  #   the extra precision can be really important. I still use ^$ for anything not-heinously-complicated
+  #   because it's more readable and still unambiguous provided you can see the end of the regexp and the
+  #   lack of an 'm' flag. if I have a block that's mixed m// and s/// close together, I'll use the 'm'.
+  # "The problem is that when a string is interpolated into a regular expression it is interpolated as a mini-regex,
+  # and special characters there behave like they do in a regular expression. So if I input '.*' into the command line
+  # in the program above, it will match all lines. This is a special case of code or markup injection."
+  #   [http://shlomif-tech.livejournal.com/35301.html] - that's what \Q and \E protect against.
+  if ($arg =~ /^play$/) { $self->{play} = 1; }
+  elsif ($arg =~ /^mp3|all$/) { $self->{mp3}++; }
+  else { die "You requested '$arg' but I don't know what this is.\n"; }
+}
+
+check_config();
+
+## main
+
+if ($config{play}) {
+
+  my $dir = "$config{'datadir'}/mp3";
+  die "Could not find '$dir'.\n" unless (-d $dir);
+
+  if ($config{'play'} >=2) { # newest
+
+    if ($config{'offline'}) {
+      foreach (validate_mp3( qx{ls -1 --sort time $dir/*.mp3} ) ) {
+        play_mp3($_);
+      }
+
+    } else { # start download and play mp3 in the meantime
+      play_and_download($dir);
+    }
+
+  } else { # play all files in a row
+    foreach (validate_mp3( glob("$dir/*.mp3") )) {
+      play_mp3($_);
+    }
+  }
+  exit;
+} # /play
+
+$self->{'offline'} and exit;
+
+# if called without arguments we only download index + info pages
+fetch_all();
+exit 0;
+
+## subs
+
+sub debug { if ($config{debug}) { print shift } }
+
 sub do_config {
   $config{'datadir'} ||= '';
   do {
@@ -66,6 +127,8 @@ sub check_config {
   $config{'dir'} ||= home().'/.frn';
   $config{'url'} = "http://www.freie-radios.net";
   $config{'index'} ||= 'index.html';
+  $config{'max_downloads'} ||= 1;
+  $config{'retries'} ||= 5;
 
   # config dif
   mkdir $config{'dir'} unless (-d $config{'dir'});
@@ -89,14 +152,12 @@ sub check_config {
       mkdir "$config{datadir}/$_" or die "Failed to create '$config{datadir}/$_': $!\n";
     }
   }
-  return 1;
-}
-
-sub show_config {
-  foreach (qw/debug play mp3 url dir datadir/) {
-    print "$_:\t". (($self->{$_}) ? $self->{$_} : 'undef') ."\n";
+  if ($config{debug}) {
+    foreach (qw/debug play mp3 url dir datadir/) {
+      print "$_:\t". (($self->{$_}) ? $self->{$_} : 'undef') ."\n";
+    }
   }
-  return;
+  return 1;
 }
 
 sub search {
@@ -104,83 +165,193 @@ sub search {
   return;
 }
 
-sub play_all {
-  # TODO search & grep
-  my $dir = "$config{'datadir'}/mp3";
-  die "Could not find '$dir'.\n" unless (-d $dir);
-  my @list = ($config{news}) ? qx{ls -1 --sort time $dir/*.mp3} : glob("$dir/*.mp3");
-  foreach (@list) {
-    chomp();
-    if (/\/(\d+-\w+-\d+\.mp3)$/) { play_mp3($_); }
-    else { debug("Bad scheme: $_\n"); }
-  }
-  exit;
+sub play_and_download {
+  my $dir = shift || "$config{'datadir'}/mp3";
+
+  my $play_index = 0;
+  my $playtime = 0;
+  do {
+    # start next download if slots are empty
+    if (check_downloads()) { fetch_entry(); }
+    unless ($playtime >0) {
+      my @list = validate_mp3(qx{ls -1 --sort time $dir/*.mp3});
+      if ($list[$play_index]) {
+        $playtime = play_mp3($list[$play_index], 1);
+        $play_index++;
+      }
+    } else { print "${playtime}s | "; }
+    sleep 5;
+    $playtime -= 5;
+  } while ($config{'last'} >0);
 }
 
 sub play_mp3 {
-  my $mp3 = shift;# || warn "play_mp3(): no file given.\n" and return;
-  print "\rPlaying $mp3 ";
-  system "mplayer -really-quiet $mp3 2>/dev/null"; print "\n";
+  my $mp3 = shift || (warn "play_mp3(): no file given.\n" and return);
+  unless (-f $mp3) { warn "play_mp3(): $mp3: file not found.\n"; return; }
+  my $background = shift||0;
+  my $mp3info = get_mp3info($mp3) || die "$@\n";
+  my $length = int($mp3info->{SECS});
+  my $bg = ($background) ? ' &' : '';
+  print "Playing $mp3 [${length}s]\n";
+  system "mplayer -really-quiet $mp3 2>/dev/null$bg";
   sleep 1; # give the user a chance to CTRL+C or read the filename if mplayer has issues
-  return 1;
+  return $length;
+}
+
+sub validate_mp3 {
+  my @list;
+  foreach (@_) {
+    chomp();
+    if (/\/(\d+-\w+-\d+\.mp3)$/) { push @list, $_; }
+    else { debug("Bad scheme: $_\n"); }
+  }
+  return @list;
 }
 
 sub update_index {
-  #unless (-f $config{index}) { # TODO fetch only if age > 1d?
-    print "Refreshing index ";
-    fetch($config{'url'}, $config{'index'});
-  #}
+  my $fn = "$config{'datadir'}/$config{'index'}";
 
-  # load index.html
-  open my $fh, '<', $config{'index'} or warn "Could not load '$config{'index'}': $!\n" and return;
-  while (my $line = <$fh>) {
-    if ($line =~ /class="btitel"><a href="\/(\d+)">/) {
+  # update index
+  print "Refreshing index.. ";
+  #fetch($config{'url'}, $fn);
+  -f $fn or die "Could not find file '$fn'.\n";
+
+  # parse index
+  my $tree = HTML::TreeBuilder::XPath->new;
+  $tree->parse_file($fn);
+
+  # On the front page we want to find the first numeric link under td of @class="btitel" to find out the youngest entry.
+  # xpath: table/tr/td/table/tr/td[@class="btitel"]/a
+  # format: <td WIDTH="*" class="btitel"><a href="/62449">&quot;<DC>ber den eigenen K<F6>rper verf<FC>gen&quot; - Sondersendung zu internationalen Frauenkampftag</a></td>        </tr>
+
+  my $a = $tree->findnodes('//td[@class="btitel"]/a')->[0];
+  unless($a) { die "Could not find latest entry in $config{'index'}.\n"; }
+
+  if ($a->attr('href') =~ /\/(\d+)$/) {
       print "\rLatest entry: $1\n";
-      close $fh;
       $config{'last'} = $1;
+      $tree->delete;
+      return $1;
+  } else { die "update_index(): Bad link format of '". $a->as_trimmed_text .' => '. $a->attr('href') ."'.\n"; }  
+}
+
+sub start_download {
+  my $url = shift || return;
+  my $fn = shift || return;
+  my $id = basename($url);
+  return if ($config{'downloads'}{$url});
+
+  unless ($url =~ /^http/) { $url = "$config{'url'}$url"; }
+  debug "\rStarting download: $url > $fn ";
+  open my $fh, '>', $fn or warn "Could not save '$fn': $!\n" and return;
+
+  # create curl handle
+  my $handle = WWW::Curl::Easy->new;
+  $handle->setopt(CURLOPT_HEADER,1);
+  $handle->setopt(CURLOPT_PRIVATE,$url);
+  $handle->setopt(CURLOPT_URL, $url);
+  $handle->setopt(CURLOPT_WRITEDATA, $fh);
+
+  # TODO Would be great to check the file size before downloading.
+
+    # Why am I using Curl rather then LWP?
+    # I live with a very throttled mobile internet connection and found perl consuming 99% cpu
+    # while loading mp3 files with LWP.
+
+    # Thin was much better regarding CPU than LWP though but it broke without clear reason
+    # and restarted several megabyte files from the beginning. So I rather hesitate to implement it.
+ 
+    # [LWP] size=342 size=17624626 [Thin] [1] 599 Internal Exception Timed
+    # out while waiting for socket to become ready for reading at /usr/share/perl/5.14/HTTP/Tiny.pm line 162
+
+    # I got a nice html graph with NYTProf showing the connection was restarted *lots* of times internally
+    # and IO::Socket::SSL ate about half of the 728s in total:
+    #   spent 128s (101+27.3) within IO::Socket::SSL::_set_rw_error which was called 2181095 times, avg 59µs/call:
+    #    2181091 times (101s+27.3s) by IO::Socket::SSL::generic_read at line 682, avg 59µs/call
+    #   spent 418s (68.9+349) within Net::HTTP::Methods::my_read which was called 2182614 times, avg 192µs/call
+    #   spent 522s (104+418) within Net::HTTP::Methods::read_entity_body which was called 2182616 times, avg 239µs/call
+    # <mst> this comes back to "the internals of LWP are full of crack"
+
+    # from WWW::Curl documentation:
+    #   The standard Perl WWW module, LWP should probably be used in most cases to work with HTTP or FTP from Perl.
+    #   However, there are some cases where LWP doesn't perform well. One is speed and the other is parallelism.
+    #   WWW::Curl is much faster, uses much less CPU cycles and it's capable of non-blocking parallel requests.
+
+  # add handle to pool
+  unless ($config{'curlm'}) {
+    $config{'curlm'} = WWW::Curl::Multi->new;
+  }
+  $config{'curlm'}->add_handle($handle);
+  $config{'active_downloads'}++;
+
+  # return handle for remote access
+  $config{'downloads'}{$url} = { id => $id, handle => \$handle, file => $fn };
+  return $url;
+}
+
+sub finish_download {
+  my $url = shift||return;
+  my $try = shift||0;
+  my $curl = $config{'downloads'}{$url}{'handle'};
+  my $retcode = $$curl->perform;
+
+  # Looking at the results...
+  if ($retcode == 0) {
+      my $response_code = $$curl->getinfo(CURLINFO_HTTP_CODE);
+      debug("ok[$response_code].\n");
+
+      # letting the curl handle get garbage collected, or we leak memory.
+      delete $config{'downloads'}{$url};
       return 1;
+
+  } else {
+      my $fn = $config{'downloads'}{$url}{'fn'};
+
+      unless ($try >= $config{'retries'}) {
+        debug "\rRetrying download of $url ($retcode ".$$curl->strerror($retcode)." ".$$curl->errbuf .")\n";
+        $config{'downloads'}{$url} = undef;
+        start_download($url, $fn);
+      }
+      return;
+  }
+}
+
+sub show_downloads {
+  my @downloads = keys %{$config{'downloads'}};
+  if (@downloads) {
+    print "\r[". join(' | ', @downloads) ."]\n";
+  }
+}
+
+sub check_downloads { # update our curl transfers
+  $config{'active_downloads'} ||= 0;
+  my $active_transfers = ($config{'curlm'}) ? $config{'curlm'}->perform : 0;
+  print "\r$config{'active_downloads'}/$config{'max_downloads'} active transfer(s) | ";
+
+  while ($active_transfers != $config{'active_downloads'}) {
+    while (my ($url,$return_value) = $config{'curlm'}->info_read) {
+      if ($url) {
+        $config{'active_downloads'}--;
+        finish_download($url);
+      }      
     }
-  } close $fh;
-  die "Could not find latest entry in $config{'index'}.\n";
+  }
+  return ($config{'max_downloads'} > $active_transfers ) ? 1 : 0;
 }
 
 sub fetch {
   my ($url, $fn) = @_;
   defined($url) or die "fetch(): no url supplied.\n";
 
-  my ($try);
+  my $try = 1;
   do {
-
     debug "[Curl] ";
-    my $curl = WWW::Curl::Easy->new;
-    $curl->setopt(CURLOPT_HEADER,1);
-    $curl->setopt(CURLOPT_URL, $url);
-
-    # A filehandle, reference to a scalar or reference to a typeglob can be used here.
-    my $response;
-    $curl->setopt(CURLOPT_WRITEDATA,\$response);
-
-    # Starts the actual request
-    my $retcode = $curl->perform;
-
-    # Looking at the results...
-    if ($retcode == 0) {
-
-      #my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
-      debug("ok.\n");
-
-      if ($fn) { return save($fn, $response); }
-      else { return $response; }
-
-    } else {
-      # Error code, type of error, error message
-      print("[$try] $retcode ".$curl->strerror($retcode)." ".$curl->errbuf."\n");
-    }
+    finish_download(start_download($url, $fn), $try) and return 1;
 
     sleep 1; # give user a chance to cancel when network interface disappeared etc.
-  } while ($try <=5);
-
-  if ($try >=5) { print "Giving up for '$url'.\n"; }
+    $try++;
+  } while ($try <= $config{'retries'});
+  print "Giving up for '$url'.\n";
   return;
 }
 
@@ -194,24 +365,17 @@ sub save {
   return 1;
 }
 
-sub parse {
+sub parse_entry_html {
   my $file = shift or die "parse(): no or empty filename given\n";
   open my $fh, '<', $file or warn "Could not read '$file': $!\n" and return;
   my @urls;
+  my $parser = HTML::TokeParser::Simple->new(handle => $fh);
 
-  foreach (<$fh>) {
-    if (/Beitrag nicht gefunden./ && $file =~ /(\d+)\.html/) { noentry($1); return; }
-    elsif (/<a href="(.+\.mp3)">Download<\/a>/) {
-      my $url = $1;
-      debug "Found mp3: $1.\n";
-      unless ($url =~ /^http/) { $url = "$config{url}$url"; }
-      push(@urls,$url);
-    } elsif (/<td><h2 class="btitel_restricted">([^<]+)<\/h2><\/td>/) {
-      print "$1\n";
-      # TODO add to db
-    } elsif (/<td colspan="2">([^<]+)<\/td>/) {
-      # TODO add to db
-    }
+  while (my $anchor = $parser->get_tag('a')) {
+    next unless defined(my $href = $anchor->get_attr('href'));
+    next unless ($href =~ /\.mp3$/);
+    push @urls, $href;
+
   } close $fh;
   return @urls;
 }
@@ -229,37 +393,55 @@ sub noentry {
   return 1;
 }
 
+sub fetch_entry {
+  my $entry = shift;
+
+  # unless a specific entry is requested we fetch the latest
+  update_index() unless ($config{'last'});
+  $entry = $config{'last'}unless ($entry);
+  print "\r$entry ";
+
+  # fetch html
+  my $dir = $config{'datadir'};
+  my $htmlfile = "$dir/html/$entry.html";
+  # TODO try to run multiple downloads in parallel
+  unless (-f $htmlfile) {
+    fetch("$config{url}/$entry", $htmlfile);
+  }
+
+  # fetch mp3
+  if ($config{'mp3'}) {
+    foreach my $url (parse_entry_html($htmlfile)) {
+      # TODO check if the file is only partially downloaded
+      my $fn = basename($url);
+      unless (-f "mp3/$fn") {
+        if (check_downloads()) { start_download($url, $fn); }
+        else { return; }
+      }
+    }
+  }
+  return 1;
+}
+
 sub fetch_all { # retrieve html + mp3
-  my $entry = shift // $config{'last'};
+  my $entry = shift || $config{'last'} || update_index();
+  my $dir = $config{'datadir'};
+  -d $dir or die "Could not find '$dir'.\n";
 
   # load list of known ids that contain no entry
-  if (open my $missing, '< noentry') { 
+  if (open my $missing, '<', "$dir/noentry") { 
     /(\d+)/ && $config{noentry}{$1}++ while <$missing>; # thanks to tm604!
     close $missing;
-  } else { warn "\rCould not open 'failed': $!\n"; }
+  } else { warn "\rCould not open '$dir/noentry': $!\n"; }
 
   # start downloads
   ENTRIES:
   while ($entry >0) {
-    if ($config{noentry}{$entry}) { $entry--; next ENTRIES; } # is handy if html cache got lost
-
-    print "\r$entry ";
-    my $htmlfile = "html/$entry.html";
-    # TODO try to run multiple downloads in parallel
-    fetch("$config{url}/$entry" , $htmlfile) unless (-f $htmlfile);
-
-    if ($config{mp3}) { # should we download mp3 files also?
-      foreach my $url (parse($htmlfile)) {
-        my $fn = basename($url);
-        # TODO check if the file is only partially downloaded
-        unless (-f "mp3/$fn") {
-          print "$url > $fn ";
-          fetch($url, "mp3/$fn");
-          print "\n";
-          sleep 1;
-        }
-      }
-    } $entry--;
+    debug "\r$entry";
+    if ($config{'noentry'}{$entry}) { $entry--; next ENTRIES; } # is handy if html cache got lost
+    if (fetch_entry($entry)) { $entry--; }
+    else { debug " download failed\n"; }
+#    show_downloads() if ($config{'debug'});
   }
 
   print "\rSeemes as we downloaded all entries.\n"; 
@@ -280,3 +462,21 @@ __END__
 # 10. FIXED also Perl has File::Basename, no need to get the shell to do it for you
 # 11. FIXED it's not a good idea to chdir
 # 12. FIXED plus that HTTP::Thin / LWP::UserAgent / LWP::Simple trifecta of HTTP modules may cause a raised eyebrow for the next person to be maintaining this code
+# 13. FIXED and bonus points for parsing HTML with regex, of course. Don't parse or modify html with regular expressions! See Mojo::DOM or one of HTML::Parser's subclasses. For a Feb-2014 coverage of main techniques see: http://xrl.us/bqnfh7 . If your response begins with "that's overkill. i only want to..." you are wrong. http://en.wikipedia.org/wiki/Chomsky_hierarchy and http://xrl.us/bf4jh6 for why not to use regex on HTML.
+
+helpful modules for HTML files:
+* HTML::TokeParser::Simple - interface to access HTML nodes
+* HTML::TreeBuilder - builds a tree representation of HTML documents
+* HTML::TreeBuilder::XPath adds the ability to locate nodes in that representation using XPath expressions
+* HTML::Strip - rip off any HTML tags to deliver pure text
+
+< http://programming.oreilly.com/2014/02/parsing-html-with-perl-2.html
+Both HTML::TokeParser::Simple (based on HTML::PullParser) and HTML::TableExtract (which subclasses HTML::Parser parse a stream rather than loading the entire document to memory and building a tree. 
+Mojo::DOM is an excellent module that uses JQuery style selectors to address individual elements http://stackoverflow.com/questions/6715677/mojodom-xpath-question
+XML::Twig will also work for some HTML documents, but in general, using an XML parser to parse HTML documents found in the wild is perilious. On the other hand, if you do have well-formed documents, or HTML::Tidy can make them nice, XML::Twig is a joy to use. Unfortunately, it is depressingly too common to find documents pretending to be HTML, using a mish-mash of XML and HTML styles, and doing all sorts of things which browsers can accommodate, but XML parsers cannot.
+And, if your purpose is just to clean some wild HTML document, use HTML::Tidy. 
+Thanks to others who have built on HTML::Parser, I have never had to write a line of event handler code myself for real work. It is not that they are difficult to write. I do recommend you study the examples bundled with the distribution to see how the underlying machinery works. https://metacpan.org/source/GAAS/HTML-Parser-3.71/eg
+
+Extra reading on regexp magic / time wasting on parsing HTML:
+http://stackoverflow.com/questions/4231382/regular-expression-pattern-not-matching-anywhere-in-string/4234582#answer-4234491
+http://search.cpan.org/~dconway/Regexp-Grammars-1.033/lib/Regexp/Grammars.pm
