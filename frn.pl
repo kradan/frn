@@ -21,13 +21,14 @@ my $self = \%config;
 # parse options
 Getopt::Long::Configure('bundling');
 GetOptions(
-	'a|all|mp3' => \$self->{'mp3'},
-	'i|index:0' => \$self->{'mp3'},
+	'a|all|mp3' => \$self->{'download_files'},
+	'i|index:0' => \$self->{'download_files'},
 	'p|play:1' => \$self->{'play'},
 	'n|news:2' => \$self->{'play'},
 	's|search=s@' => \&search, # TODO
 	'o|offline' => \$self->{'offline'},
-	'd|debug|v' => \$self->{'debug'},
+	'd|debug:2' => \$self->{'verbose'},
+	'v|verbose:1' => \$self->{'verbose'},
 	'h|help|?' => \&help
 );
 
@@ -62,8 +63,9 @@ while(my $arg = shift) {
   # and special characters there behave like they do in a regular expression. So if I input '.*' into the command line
   # in the program above, it will match all lines. This is a special case of code or markup injection."
   #   [http://shlomif-tech.livejournal.com/35301.html] - that's what \Q and \E protect against.
-  if ($arg =~ /^play$/) { $self->{play} = 1; }
-  elsif ($arg =~ /^mp3|all$/) { $self->{mp3}++; }
+  if ($arg =~ /^play$/) { $self->{'play'}++; }
+  elsif ($arg =~ /^news$/) { $self->{'play'} = 2; }
+  elsif ($arg =~ /^all$/) { $self->{'download_all'}++; }
   else { die "You requested '$arg' but I don't know what this is.\n"; }
 }
 
@@ -97,13 +99,15 @@ if ($config{play}) {
 
 $self->{'offline'} and exit;
 
-# if called without arguments we only download index + info pages
-fetch_all();
+# if called without arguments we download index + all info pages
+fetch_entries(1);
 exit 0;
 
 ## subs
 
-sub debug { if ($config{debug}) { print shift } }
+# OPTIMIZE
+sub verbose { if ($config{verbose} ) { print shift; } }
+sub debug { if ($config{verbose} >=2) { print shift; } }
 
 sub do_config {
   $config{'datadir'} ||= '';
@@ -127,7 +131,7 @@ sub check_config {
   $config{'dir'} ||= home().'/.frn';
   $config{'url'} = "http://www.freie-radios.net";
   $config{'index'} ||= 'index.html';
-  $config{'max_downloads'} ||= 1;
+  $config{'max_downloads'} ||= 1; # used for files
   $config{'retries'} ||= 5;
 
   # config dif
@@ -138,7 +142,7 @@ sub check_config {
   }
 
   # read config
-  open my $fh, '<', "$config{dir}/config" or die "Could not open '$config{dir}/config': $!\n";
+  open my $fh, '<', "$config{'dir'}/config" or die "Could not open '$config{'dir'}/config': $!\n";
   while (my $line = <$fh>) { 
     if ($line =~ /^(.+)=(.+)$/) {
       $config{$1} = $2;
@@ -146,10 +150,10 @@ sub check_config {
   } close $fh;
 
   # prepare datadir
-  mkdir $config{datadir} unless (-d $config{datadir});
+  mkdir $config{'datadir'} unless (-d $config{'datadir'});
   foreach (qw/html mp3/) {
-    unless (-d "$config{datadir}/$_") {
-      mkdir "$config{datadir}/$_" or die "Failed to create '$config{datadir}/$_': $!\n";
+    unless (-d "$config{'datadir'}/$_") {
+      mkdir "$config{'datadir'}/$_" or die "Failed to create '$config{'datadir'}/$_': $!\n";
     }
   }
   if ($config{debug}) {
@@ -168,21 +172,25 @@ sub search {
 sub play_and_download {
   my $dir = shift || "$config{'datadir'}/mp3";
 
-  my $play_index = 0;
-  my $playtime = 0;
   do {
-    # start next download if slots are empty
-    if (check_downloads()) { fetch_entry(); }
-    unless ($playtime >0) {
+    # start playback
+    unless ($config{'mp3'}{'playing'}) {
       my @list = validate_mp3(qx{ls -1 --sort time $dir/*.mp3});
-      if ($list[$play_index]) {
-        $playtime = play_mp3($list[$play_index], 1);
-        $play_index++;
+      my $index = $config{'mp3'}{'index'} ||0;
+      if ($list[$index]) {
+        play_mp3($list[$index], 1);
+        $config{'mp3'}{'index'}++; # TODO cache this somewhere
       }
-    } else { print "${playtime}s | "; }
-    sleep 5;
-    $playtime -= 5;
-  } while ($config{'last'} >0);
+    }
+
+    # start next download when slot is available
+    while (check_downloads()) { fetch_entry(); }
+
+    # status & timing
+    status_line();
+    sleep 1;
+  } while ($config{'current_entry'} >0);
+  # OPTIMIZE this one is similar to fetch_entries()
 }
 
 sub play_mp3 {
@@ -190,12 +198,17 @@ sub play_mp3 {
   unless (-f $mp3) { warn "play_mp3(): $mp3: file not found.\n"; return; }
   my $background = shift||0;
   my $mp3info = get_mp3info($mp3) || die "$@\n";
-  my $length = int($mp3info->{SECS});
   my $bg = ($background) ? ' &' : '';
-  print "Playing $mp3 [${length}s]\n";
+  $config{'mp3'}{'playing'} = basename($mp3);
+  $config{'mp3'}{'playtime'} = int($mp3info->{SECS});
+  $config{'mp3'}{'starttime'} = time();
+  status_line();
+
+  # TODO enable user interaction to skip files
   system "mplayer -really-quiet $mp3 2>/dev/null$bg";
+
   sleep 1; # give the user a chance to CTRL+C or read the filename if mplayer has issues
-  return $length;
+  return $mp3;
 }
 
 sub validate_mp3 {
@@ -212,7 +225,6 @@ sub update_index {
   my $fn = "$config{'datadir'}/$config{'index'}";
 
   # update index
-  print "Refreshing index.. ";
   #fetch($config{'url'}, $fn);
   -f $fn or die "Could not find file '$fn'.\n";
 
@@ -228,7 +240,6 @@ sub update_index {
   unless($a) { die "Could not find latest entry in $config{'index'}.\n"; }
 
   if ($a->attr('href') =~ /\/(\d+)$/) {
-      print "\rLatest entry: $1\n";
       $config{'last'} = $1;
       $tree->delete;
       return $1;
@@ -242,7 +253,7 @@ sub start_download {
   return if ($config{'downloads'}{$url});
 
   unless ($url =~ /^http/) { $url = "$config{'url'}$url"; }
-  debug "\rStarting download: $url > $fn ";
+  debug "\rStarting download: $url > $fn\n";
   open my $fh, '>', $fn or warn "Could not save '$fn': $!\n" and return;
 
   # create curl handle
@@ -283,36 +294,37 @@ sub start_download {
   }
   $config{'curlm'}->add_handle($handle);
   $config{'active_downloads'}++;
+  status_line();
 
   # return handle for remote access
-  $config{'downloads'}{$url} = { id => $id, handle => \$handle, file => $fn };
+  %{$config{'downloads'}{$url}} = ( id => $id, handle => \$handle, file => $fn );
   return $url;
 }
 
 sub finish_download {
   my $url = shift||return;
   my $try = shift||0;
-  my $curl = $config{'downloads'}{$url}{'handle'};
-  my $retcode = $$curl->perform;
+  my $curl = ${$config{'downloads'}{$url}{'handle'}};
+  my $retcode = $curl->perform;
 
   # Looking at the results...
   if ($retcode == 0) {
-      my $response_code = $$curl->getinfo(CURLINFO_HTTP_CODE);
-      debug("ok[$response_code].\n");
+    #my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
+    #debug("ok[$response_code].\n");
 
-      # letting the curl handle get garbage collected, or we leak memory.
-      delete $config{'downloads'}{$url};
-      return 1;
+    # letting the curl handle get garbage collected, or we leak memory.
+    delete $config{'downloads'}{$url};
+    return 1;
 
   } else {
-      my $fn = $config{'downloads'}{$url}{'fn'};
+    my $fn = $config{'downloads'}{$url}{'fn'};
 
-      unless ($try >= $config{'retries'}) {
-        debug "\rRetrying download of $url ($retcode ".$$curl->strerror($retcode)." ".$$curl->errbuf .")\n";
-        $config{'downloads'}{$url} = undef;
-        start_download($url, $fn);
-      }
-      return;
+    unless ($try >= $config{'retries'}) {
+      debug "\rRetrying download of $url ($retcode ".$curl->strerror($retcode)." ".$curl->errbuf .")\n";
+      $config{'downloads'}{$url} = undef;
+      start_download($url, $fn);
+    }
+    return;
   }
 }
 
@@ -324,19 +336,42 @@ sub show_downloads {
 }
 
 sub check_downloads { # update our curl transfers
+  # call this regularly to catch all received packets and send responses in time
+  my $max = shift || $config{'max_downloads'};
   $config{'active_downloads'} ||= 0;
+
   my $active_transfers = ($config{'curlm'}) ? $config{'curlm'}->perform : 0;
-  print "\r$config{'active_downloads'}/$config{'max_downloads'} active transfer(s) | ";
 
   while ($active_transfers != $config{'active_downloads'}) {
     while (my ($url,$return_value) = $config{'curlm'}->info_read) {
       if ($url) {
-        $config{'active_downloads'}--;
         finish_download($url);
+        $config{'active_downloads'}--;
+        status_line();
       }      
     }
   }
-  return ($config{'max_downloads'} > $active_transfers ) ? 1 : 0;
+  return ($max > $active_transfers ) ? 1 : 0;
+}
+
+sub status_line {
+  my ($s,$m,$h) = localtime();
+  my $time = sprintf "%02i:%02i:%02i", $h, $m, $s;
+  $config{'active_downloads'}||=0;
+  my $downloads = "$config{'active_downloads'}/$config{'max_downloads'} transfer(s)";
+  my $entry = $config{'current_entry'} ? "$config{'current_entry'}/$config{'last'}" : '?';
+  my $playing = 'no audio';
+  if ($config{'mp3'}{'playing'}) {
+    my $resttime = $config{'mp3'}{'playtime'} - (time() - $config{'mp3'}{'starttime'});
+    unless ($resttime >0) {
+      delete $config{'mp3'}{'playing'};
+      delete $config{'mp3'}{'playtime'};
+      delete $config{'mp3'}{'starttime'};
+    } else {
+      $playing = "$config{'mp3'}{'playing'} [${resttime}s]";
+    }
+  }
+  print "\r[$time] $downloads | $entry | $playing";
 }
 
 sub fetch {
@@ -350,6 +385,7 @@ sub fetch {
 
     sleep 1; # give user a chance to cancel when network interface disappeared etc.
     $try++;
+
   } while ($try <= $config{'retries'});
   print "Giving up for '$url'.\n";
   return;
@@ -394,57 +430,66 @@ sub noentry {
 }
 
 sub fetch_entry {
-  my $entry = shift;
+  # check dir
+  my $dir = $config{'datadir'};
+  -d $dir or die "Could not find '$dir'.\n";
 
-  # unless a specific entry is requested we fetch the latest
-  update_index() unless ($config{'last'});
-  $entry = $config{'last'}unless ($entry);
-  print "\r$entry ";
+  unless ($config{'noentry'} && $config{'current_entry'}) {
+    # load list of known ids that contain no entry
+    if (open my $missing, '<', "$dir/noentry") { 
+      /(\d+)/ && $config{'noentry'}{$1}++ while <$missing>; # thanks to tm604!
+      close $missing;
+    } else { warn "\rCould not open '$dir/noentry': $!\n"; }
+
+    # refresh index
+    unless ($config{'last'}) { update_index(); }
+    $config{'current_entry'} ||= $config{'last'};
+  }
+
+  # if we are lucky there is an index of invalid entries
+  while ($config{'noentry'}{ $config{'current_entry'} }) { $config{'current_entry'}--; }
+
+  # what to download?
+  my $entry = shift;
+  $entry ||= $config{'current_entry'};
+  status_line();
 
   # fetch html
   my $dir = $config{'datadir'};
   my $htmlfile = "$dir/html/$entry.html";
-  # TODO try to run multiple downloads in parallel
+
   unless (-f $htmlfile) {
-    fetch("$config{url}/$entry", $htmlfile);
+    check_downloads(3) # OPTIMIZE we allow us to have three in parallel ignoring the user defined limit
+      and start_download("$config{url}/$entry", $htmlfile) or return;
   }
 
   # fetch mp3
-  if ($config{'mp3'}) {
+  if ($config{'download_files'}) {
     foreach my $url (parse_entry_html($htmlfile)) {
       # TODO check if the file is only partially downloaded
       my $fn = basename($url);
       unless (-f "mp3/$fn") {
-        if (check_downloads()) { start_download($url, $fn); }
-        else { return; }
+        check_downloads() and start_download($url, $fn) or return;
       }
     }
   }
+  $config{'current_entry'}--;
   return 1;
 }
 
-sub fetch_all { # retrieve html + mp3
-  my $entry = shift || $config{'last'} || update_index();
-  my $dir = $config{'datadir'};
-  -d $dir or die "Could not find '$dir'.\n";
+sub fetch_entries {
+  my $all = shift;
 
-  # load list of known ids that contain no entry
-  if (open my $missing, '<', "$dir/noentry") { 
-    /(\d+)/ && $config{noentry}{$1}++ while <$missing>; # thanks to tm604!
-    close $missing;
-  } else { warn "\rCould not open '$dir/noentry': $!\n"; }
+  do { # start downloads
+    # start next download when slot is available
+    while (check_downloads()) { fetch_entry(); }
 
-  # start downloads
-  ENTRIES:
-  while ($entry >0) {
-    debug "\r$entry";
-    if ($config{'noentry'}{$entry}) { $entry--; next ENTRIES; } # is handy if html cache got lost
-    if (fetch_entry($entry)) { $entry--; }
-    else { debug " download failed\n"; }
-#    show_downloads() if ($config{'debug'});
-  }
+    # status & timing
+    status_line();
+    sleep 1;
+  } while ($all && $config{'current_entry'}>0);
 
-  print "\rSeemes as we downloaded all entries.\n"; 
+  print "\rSeemes as we downloaded all entries.\n" unless ($config{'current_entry'} >0); 
   return 1;
 }
 __END__
@@ -480,3 +525,8 @@ Thanks to others who have built on HTML::Parser, I have never had to write a lin
 Extra reading on regexp magic / time wasting on parsing HTML:
 http://stackoverflow.com/questions/4231382/regular-expression-pattern-not-matching-anywhere-in-string/4234582#answer-4234491
 http://search.cpan.org/~dconway/Regexp-Grammars-1.033/lib/Regexp/Grammars.pm
+
+# I have an open issue to have use timers for non-blocking downloads with curl, playing audio with mplayer, showing the status of both while beeing to able to access the mplayer interface at the same time. the way to implement that which I know of are fork or threads but I would like to get around both.
+# The way to do this is an event driven mechanism: Asynchronous event-driven IO is awesome in Perl with POE (dngor), IO::Async (LeoNerd), IO::Lambda, Reflex, AnyEvent and Coro, among others.
+
+
