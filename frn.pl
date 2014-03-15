@@ -28,7 +28,7 @@ GetOptions(
 	's|search=s@' => \&search, # TODO
 	'o|offline' => \$self->{'offline'},
 	'd|debug:2' => \$self->{'verbose'},
-	'v|verbose:1' => \$self->{'verbose'},
+	'v|verbose:2' => \$self->{'verbose'},
 	'h|help|?' => \&help
 );
 
@@ -66,7 +66,11 @@ while(my $arg = shift) {
   if ($arg =~ /^play$/) { $self->{'play'}++; }
   elsif ($arg =~ /^news$/) { $self->{'play'} = 2; }
   elsif ($arg =~ /^all$/) { $self->{'download_all'}++; }
-  else { die "You requested '$arg' but I don't know what this is.\n"; }
+  elsif ($arg =~ /^(\d+)$/) {
+    if ($self->{'play'}) {
+      $self->{'mp3'}->{'index'} = $1;
+    }
+  } else { die "You requested '$arg' but I don't know what this is.\n"; }
 }
 
 check_config();
@@ -79,20 +83,10 @@ if ($config{play}) {
   die "Could not find '$dir'.\n" unless (-d $dir);
 
   if ($config{'play'} >=2) { # newest
+    playback( qx{ls -1 --sort time $dir/*.mp3} );
 
-    if ($config{'offline'}) {
-      foreach (validate_mp3( qx{ls -1 --sort time $dir/*.mp3} ) ) {
-        play_mp3($_);
-      }
-
-    } else { # start download and play mp3 in the meantime
-      play_and_download($dir);
-    }
-
-  } else { # play all files in a row
-    foreach (validate_mp3( glob("$dir/*.mp3") )) {
-      play_mp3($_);
-    }
+  } else { # play all files in alphabetical order
+    playback( glob("$dir/*.mp3") );
   }
   exit;
 } # /play
@@ -105,14 +99,13 @@ exit 0;
 
 ## subs
 
-# OPTIMIZE
-sub verbose { if ($config{verbose} ) { print shift; } }
-sub debug { if ($config{verbose} >=2) { print shift; } }
+sub verbose { if ($self->{'verbose'} ) { print shift; } } # OPTIMIZE
+sub debug { if ($self->{'verbose'} && $self->{'verbose'} >=2) { print shift; } }
 
 sub do_config {
   $config{'datadir'} ||= '';
   do {
-    print "Where to save mp3 and html files? Leave empty to store it in $config{'dir'} [$config{'data'}] ";
+    print "Where to save mp3 and html files? Leave empty to store them in '$config{'dir'}'. [$config{'data'}] ";
     chomp(my $datadir = <STDIN>);
     unless ($datadir) { $config{'datadir'} = $config{'dir'}; }
     elsif (! -d $datadir) {
@@ -150,7 +143,7 @@ sub check_config {
   } close $fh;
 
   # prepare datadir
-  mkdir $config{'datadir'} unless (-d $config{'datadir'});
+  -d $config{'datadir'} or mkdir $config{'datadir'} or die "Could not create '$config{'datadir'}': $!\n";
   foreach (qw/html mp3/) {
     unless (-d "$config{'datadir'}/$_") {
       mkdir "$config{'datadir'}/$_" or die "Failed to create '$config{'datadir'}/$_': $!\n";
@@ -169,45 +162,57 @@ sub search {
   return;
 }
 
-sub play_and_download {
-  my $dir = shift || "$config{'datadir'}/mp3";
+sub playback {
+  my @list = validate_mp3(@_);
+  $config{'mp3'}{'index'} ||= 0;
 
-  do {
+  # catch keypresses
+  use Term::TermKey qw( FLAG_UTF8 RES_EOF FORMAT_VIM );
+ 
+  my $tk = Term::TermKey->new(\*STDIN);
+ 
+  # ensure perl and libtermkey agree on Unicode handling
+  binmode( STDOUT, ":encoding(UTF-8)" ) if $tk->get_flags & FLAG_UTF8;
+
+  while ($list[ $config{'mp3'}{'index'} ]) {
+
     # start playback
     unless ($config{'mp3'}{'playing'}) {
-      my @list = validate_mp3(qx{ls -1 --sort time $dir/*.mp3});
-      my $index = $config{'mp3'}{'index'} ||0;
-      if ($list[$index]) {
-        play_mp3($list[$index], 1);
-        $config{'mp3'}{'index'}++; # TODO cache this somewhere
-      }
+      play_mp3($list[ $config{'mp3'}{'index'} ], 1);
     }
 
-    # start next download when slot is available
-    while (check_downloads()) { fetch_entry(); }
+    unless ($self->{'offline'}) {
+      # start next download when slot is available
+      while (check_downloads()) { fetch_entry(); }
+    }
 
     # status & timing
     status_line();
     sleep 1;
-  } while ($config{'current_entry'} >0);
+  }
+
+  # after playback continue download
   # OPTIMIZE this one is similar to fetch_entries()
+  fetch_entries(1) unless ($self->{'offline'});
 }
 
 sub play_mp3 {
-  my $mp3 = shift || (warn "play_mp3(): no file given.\n" and return);
-  unless (-f $mp3) { warn "play_mp3(): $mp3: file not found.\n"; return; }
-  my $background = shift||0;
+  my $mp3 = shift || (warn "\rplay_mp3(): no file given.\n" and return);
+  unless (-f $mp3) { warn "\rplay_mp3(): $mp3: file not found.\n"; return; }
   my $mp3info = get_mp3info($mp3) || die "$@\n";
-  my $bg = ($background) ? ' &' : '';
+
   $config{'mp3'}{'playing'} = basename($mp3);
   $config{'mp3'}{'playtime'} = int($mp3info->{SECS});
   $config{'mp3'}{'starttime'} = time();
+
+  unless ($self->{'mplayer_fh'}) {
+    open $self->{mplayer_fh}, "| mplayer -slave -nofs -nokeepaspect -input nodefault-bindings:conf=/dev/null -zoom -fixed-vo -really-quiet -loop 0 '$mp3' 2>/dev/null" or warn "\rCould not connect to mplayer: $!\n";
+  } else {
+    debug "\rPlaying $mp3";
+    print {$self->{'mplayer_fh'}} "$mp3\n";
+  }
+
   status_line();
-
-  # TODO enable user interaction to skip files
-  system "mplayer -really-quiet $mp3 2>/dev/null$bg";
-
-  sleep 1; # give the user a chance to CTRL+C or read the filename if mplayer has issues
   return $mp3;
 }
 
@@ -248,20 +253,40 @@ sub update_index {
 
 sub start_download {
   my $url = shift || return;
-  my $fn = shift || return;
-  my $id = basename($url);
-  return if ($config{'downloads'}{$url});
-
+  if ($config{'downloads'}{$url}) { status_line ("already downloading '$url'"); return; };
   unless ($url =~ /^http/) { $url = "$config{'url'}$url"; }
-  debug "\rStarting download: $url > $fn\n";
-  open my $fh, '>', $fn or warn "Could not save '$fn': $!\n" and return;
+  my $id = basename($url);
 
-  # create curl handle
-  my $handle = WWW::Curl::Easy->new;
-  $handle->setopt(CURLOPT_HEADER,1);
-  $handle->setopt(CURLOPT_PRIVATE,$url);
-  $handle->setopt(CURLOPT_URL, $url);
-  $handle->setopt(CURLOPT_WRITEDATA, $fh);
+  my $fn = shift || return;
+
+  try {
+    # create curl handle
+    my $handle = WWW::Curl::Easy->new;
+    $handle->setopt(CURLOPT_HEADER,1);
+    $handle->setopt(CURLOPT_URL, $url);
+    $handle->setopt(CURLOPT_PRIVATE,$url);
+
+    open my $fh, '>>', $fn or warn "Could not save '$fn': $!\n" and return;
+    $handle->setopt(CURLOPT_WRITEDATA, $fh);
+
+    # add handle to pool
+    unless ($config{'curlm'}) {
+      $config{'curlm'} = WWW::Curl::Multi->new;
+    }
+    $config{'curlm'}->add_handle($handle);
+    $config{'active_downloads'}++;
+
+    # return handle for remote access
+    %{$config{'downloads'}{$url}} = ( id => $id, handle => \$handle, file => $fn );
+
+    status_line ("$url > $fn") if ($self->{'verbose'});
+    status_line();
+    return $url;
+
+  } catch {
+    print "\rCould not start download for '$url': $1\n";
+    return;
+  }
 
   # TODO Would be great to check the file size before downloading.
 
@@ -269,14 +294,14 @@ sub start_download {
     # I live with a very throttled mobile internet connection and found perl consuming 99% cpu
     # while loading mp3 files with LWP.
 
-    # Thin was much better regarding CPU than LWP though but it broke without clear reason
+    # Thin was much better regarding CPU than LWP but it broke without clear reason
     # and restarted several megabyte files from the beginning. So I rather hesitate to implement it.
  
-    # [LWP] size=342 size=17624626 [Thin] [1] 599 Internal Exception Timed
-    # out while waiting for socket to become ready for reading at /usr/share/perl/5.14/HTTP/Tiny.pm line 162
+    # [LWP] size=342 size=17624626 [Thin] [1] 599 Internal Exception Timed out while waiting for socket
+    # to become ready for reading at /usr/share/perl/5.14/HTTP/Tiny.pm line 162
 
     # I got a nice html graph with NYTProf showing the connection was restarted *lots* of times internally
-    # and IO::Socket::SSL ate about half of the 728s in total:
+    # and IO::Socket::SSL ate about half of the cpu time:
     #   spent 128s (101+27.3) within IO::Socket::SSL::_set_rw_error which was called 2181095 times, avg 59µs/call:
     #    2181091 times (101s+27.3s) by IO::Socket::SSL::generic_read at line 682, avg 59µs/call
     #   spent 418s (68.9+349) within Net::HTTP::Methods::my_read which was called 2182614 times, avg 192µs/call
@@ -288,29 +313,19 @@ sub start_download {
     #   However, there are some cases where LWP doesn't perform well. One is speed and the other is parallelism.
     #   WWW::Curl is much faster, uses much less CPU cycles and it's capable of non-blocking parallel requests.
 
-  # add handle to pool
-  unless ($config{'curlm'}) {
-    $config{'curlm'} = WWW::Curl::Multi->new;
-  }
-  $config{'curlm'}->add_handle($handle);
-  $config{'active_downloads'}++;
-  status_line();
-
-  # return handle for remote access
-  %{$config{'downloads'}{$url}} = ( id => $id, handle => \$handle, file => $fn );
-  return $url;
 }
 
 sub finish_download {
   my $url = shift||return;
   my $try = shift||0;
   my $curl = ${$config{'downloads'}{$url}{'handle'}};
+  return unless $curl;
   my $retcode = $curl->perform;
 
   # Looking at the results...
   if ($retcode == 0) {
-    #my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
-    #debug("ok[$response_code].\n");
+    my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
+    debug "ok[$response_code].\r";
 
     # letting the curl handle get garbage collected, or we leak memory.
     delete $config{'downloads'}{$url};
@@ -320,7 +335,7 @@ sub finish_download {
     my $fn = $config{'downloads'}{$url}{'fn'};
 
     unless ($try >= $config{'retries'}) {
-      debug "\rRetrying download of $url ($retcode ".$curl->strerror($retcode)." ".$curl->errbuf .")\n";
+      debug "$retcode ".$curl->strerror($retcode)." ".$curl->errbuf ." - retrying download.\n";
       $config{'downloads'}{$url} = undef;
       start_download($url, $fn);
     }
@@ -342,36 +357,53 @@ sub check_downloads { # update our curl transfers
 
   my $active_transfers = ($config{'curlm'}) ? $config{'curlm'}->perform : 0;
 
-  while ($active_transfers != $config{'active_downloads'}) {
+  if ($active_transfers != $config{'active_downloads'}) {
     while (my ($url,$return_value) = $config{'curlm'}->info_read) {
       if ($url) {
+	debug "\rFinishing download of '$url'.. ";
         finish_download($url);
         $config{'active_downloads'}--;
         status_line();
       }      
     }
+    # fix counting errors
+    $config{'active_downloads'} = $active_transfers if ($active_transfers > $config{'active_downloads'});
   }
+
+  # the calling function usually wants to know if there are empty slots
   return ($max > $active_transfers ) ? 1 : 0;
 }
 
 sub status_line {
+  my $msg = shift;
+
   my ($s,$m,$h) = localtime();
   my $time = sprintf "%02i:%02i:%02i", $h, $m, $s;
   $config{'active_downloads'}||=0;
-  my $downloads = "$config{'active_downloads'}/$config{'max_downloads'} transfer(s)";
-  my $entry = $config{'current_entry'} ? "$config{'current_entry'}/$config{'last'}" : '?';
+
+  if ($msg) { print "\r[$time] $msg\n"; return; }
+
+  my $downloads = 'offline-mode';
+  unless ($self->{'offline'}) {  
+    $downloads = "$config{'active_downloads'}/$config{'max_downloads'} transfer(s)";
+  }
+  my $entry = $config{'current_entry'} ? " | $config{'current_entry'}/$config{'last'}" : '';
+
   my $playing = 'no audio';
   if ($config{'mp3'}{'playing'}) {
     my $resttime = $config{'mp3'}{'playtime'} - (time() - $config{'mp3'}{'starttime'});
+
     unless ($resttime >0) {
       delete $config{'mp3'}{'playing'};
       delete $config{'mp3'}{'playtime'};
       delete $config{'mp3'}{'starttime'};
+      $config{'mp3'}{'index'}++; # TODO cache this somewhere
+
     } else {
-      $playing = "$config{'mp3'}{'playing'} [${resttime}s]";
+      $playing = "$config{'mp3'}{'index'}:$config{'mp3'}{'playing'} [${resttime}s]";
     }
   }
-  print "\r[$time] $downloads | $entry | $playing";
+  print "\r[$time] $downloads$entry | $playing";
 }
 
 sub fetch {
@@ -396,7 +428,7 @@ sub save {
   return unless (defined($fn));
 
   open my $fh, '>', $fn or die "could not write to '$fn': $!\n";
-  print $fh @data;
+  print {$fh} @data;
   close $fh;
   return 1;
 }
@@ -424,7 +456,7 @@ sub noentry {
   my $id = shift or warn "failed(): no id given\n" and return;
   return unless ($id =~ /(\d+)/);
   open my $fh, '>> noentry' or die "Could not write to 'noentry': $!\n";
-  print $fh "$1\n";
+  print {$fh} "$1\n";
   close $fh;
   return 1;
 }
@@ -432,7 +464,7 @@ sub noentry {
 sub fetch_entry {
   # check dir
   my $dir = $config{'datadir'};
-  -d $dir or die "Could not find '$dir'.\n";
+  #-d $dir or die "Could not find '$dir'.\n"; # OPTIMIZE speed
 
   unless ($config{'noentry'} && $config{'current_entry'}) {
     # load list of known ids that contain no entry
@@ -450,30 +482,33 @@ sub fetch_entry {
   while ($config{'noentry'}{ $config{'current_entry'} }) { $config{'current_entry'}--; }
 
   # what to download?
-  my $entry = shift;
-  $entry ||= $config{'current_entry'};
-  status_line();
+  my $entry = shift || $config{'current_entry'};
+  #status_line();
 
   # fetch html
-  my $dir = $config{'datadir'};
   my $htmlfile = "$dir/html/$entry.html";
 
   unless (-f $htmlfile) {
     check_downloads(3) # OPTIMIZE we allow us to have three in parallel ignoring the user defined limit
-      and start_download("$config{url}/$entry", $htmlfile) or return;
+      and start_download("$config{url}/$entry", $htmlfile);
+    return;
   }
 
   # fetch mp3
   if ($config{'download_files'}) {
     foreach my $url (parse_entry_html($htmlfile)) {
       # TODO check if the file is only partially downloaded
-      my $fn = basename($url);
-      unless (-f "mp3/$fn") {
-        check_downloads() and start_download($url, $fn) or return;
+      my $fn = "$dir/mp3/". basename($url);
+      unless (-f $fn) {
+        debug "\rneed to download '$url' ";
+        check_downloads() and start_download($url, $fn);
+        return;
       }
     }
   }
-  $config{'current_entry'}--;
+
+  # if no download has been started the entry should be complete
+  $config{'current_entry'}--; 
   return 1;
 }
 
@@ -492,7 +527,19 @@ sub fetch_entries {
   print "\rSeemes as we downloaded all entries.\n" unless ($config{'current_entry'} >0); 
   return 1;
 }
+
 __END__
+FIXME download of mp3s is not working yet
+TODO add documentation: http://perldoc.perl.org/perlpod.html
+TODO add tests http://perl-begin.org/uses/qa/
+
+TODO undestand:
+https://en.wikipedia.org/wiki/Chomsky_hierarchy
+https://en.wikipedia.org/wiki/Finite_state_automaton
+https://en.wikipedia.org/wiki/Automata_theory
+
+http://www.mplayerhq.hu/DOCS/tech/slave.txt
+
 # Thanks #perl for the hints!
 # 0. http://perl-begin.org/tutorials/bad-elements/
 # 1. FIXED if code needs to be read bottom up, it may improve from a re-arrangement
@@ -528,5 +575,3 @@ http://search.cpan.org/~dconway/Regexp-Grammars-1.033/lib/Regexp/Grammars.pm
 
 # I have an open issue to have use timers for non-blocking downloads with curl, playing audio with mplayer, showing the status of both while beeing to able to access the mplayer interface at the same time. the way to implement that which I know of are fork or threads but I would like to get around both.
 # The way to do this is an event driven mechanism: Asynchronous event-driven IO is awesome in Perl with POE (dngor), IO::Async (LeoNerd), IO::Lambda, Reflex, AnyEvent and Coro, among others.
-
-
