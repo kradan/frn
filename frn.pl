@@ -5,13 +5,13 @@ use warnings;
 use Getopt::Long;
 use File::Basename;
 use File::Glob ':glob';
+
+# run 'cpan -i File::HomeDir HTML::TokeParser::Simple HTML::TreeBuilder::XPath' as root to install needed modules.
 use File::HomeDir;
-use WWW::Curl::Easy;
 use HTML::TokeParser::Simple;
 use HTML::TreeBuilder::XPath;
-use Try::Tiny;
-use MP3::Info;
 use IO::Handle;
+
 STDOUT->autoflush(1);
 
 # OPTIMIZE global container
@@ -73,11 +73,13 @@ while(my $arg = shift) {
   } else { die "You requested '$arg' but I don't know what this is.\n"; }
 }
 
-check_config();
+check_config(); # loads or creates config file
 
 ## main
 
-if ($config{play}) {
+if (0 && $config{play}) { # TODO disabled
+
+  #use 'playback.pm';
 
   my $dir = "$config{'datadir'}/mp3";
   die "Could not find '$dir'.\n" unless (-d $dir);
@@ -91,9 +93,9 @@ if ($config{play}) {
   exit;
 } # /play
 
-$self->{'offline'} and exit;
+$self->{'offline'} and exit; # exit after playing in offline mode
 
-# if called without arguments we download index + all info pages
+# if called without arguments we download the index and linked info pages
 fetch_entries(1);
 exit 0;
 
@@ -105,13 +107,13 @@ sub debug { if ($self->{'verbose'} && $self->{'verbose'} >=2) { print shift; } }
 sub do_config {
   $config{'datadir'} ||= '';
   do {
-    print "Where to save mp3 and html files? Leave empty to store them in '$config{'dir'}'. [$config{'data'}] ";
+    print "Where to save mp3 and html files? Leave empty to store them in '$config{'dir'}'. [$config{'datadir'}] ";
     chomp(my $datadir = <STDIN>);
     unless ($datadir) { $config{'datadir'} = $config{'dir'}; }
     elsif (! -d $datadir) {
       if (mkdir $datadir) { $config{'datadir'} = $datadir; }
       else { warn "Could not create '$datadir': $!\n"; }
-    }
+    } elsif (-d $datadir) {  $config{'datadir'} = $datadir; }
   } until ($config{'datadir'});
   open my $fh, '>', "$config{'dir'}/config" or die "Could not save '$config{'dir'}/config': $!\n";
   print $fh "datadir=$config{'datadir'}\n";
@@ -131,7 +133,7 @@ sub check_config {
   mkdir $config{'dir'} unless (-d $config{'dir'});
 
   unless (-f "$config{'dir'}/config") { # create new config if necessary
-    do_config or die "Could not create '$config{'dir'}/config'.\n";
+    do_config() or die "Could not create '$config{'dir'}/config'.\n";
   }
 
   # read config
@@ -162,216 +164,39 @@ sub search {
   return;
 }
 
-sub playback {
-  my @list = validate_mp3(@_);
-  $config{'mp3'}{'index'} ||= 0;
-
-  # catch keypresses
-  use Term::TermKey qw( FLAG_UTF8 RES_EOF FORMAT_VIM );
- 
-  my $tk = Term::TermKey->new(\*STDIN);
- 
-  # ensure perl and libtermkey agree on Unicode handling
-  binmode( STDOUT, ":encoding(UTF-8)" ) if $tk->get_flags & FLAG_UTF8;
-
-  while ($list[ $config{'mp3'}{'index'} ]) {
-
-    # start playback
-    unless ($config{'mp3'}{'playing'}) {
-      play_mp3($list[ $config{'mp3'}{'index'} ], 1);
-    }
-
-    unless ($self->{'offline'}) {
-      # start next download when slot is available
-      while (check_downloads()) { fetch_entry(); }
-    }
-
-    # status & timing
-    status_line();
-    sleep 1;
-  }
-
-  # after playback continue download
-  # OPTIMIZE this one is similar to fetch_entries()
-  fetch_entries(1) unless ($self->{'offline'});
+sub check_downloads {
+  return 1;
 }
 
-sub play_mp3 {
-  my $mp3 = shift || (warn "\rplay_mp3(): no file given.\n" and return);
-  unless (-f $mp3) { warn "\rplay_mp3(): $mp3: file not found.\n"; return; }
-  my $mp3info = get_mp3info($mp3) || die "$@\n";
-
-  $config{'mp3'}{'playing'} = basename($mp3);
-  $config{'mp3'}{'playtime'} = int($mp3info->{SECS});
-  $config{'mp3'}{'starttime'} = time();
-
-  unless ($self->{'mplayer_fh'}) {
-    open $self->{mplayer_fh}, "| mplayer -slave -nofs -nokeepaspect -input nodefault-bindings:conf=/dev/null -zoom -fixed-vo -really-quiet -loop 0 '$mp3' 2>/dev/null" or warn "\rCould not connect to mplayer: $!\n";
-  } else {
-    debug "\rPlaying $mp3";
-    print {$self->{'mplayer_fh'}} "$mp3\n";
-  }
-
-  status_line();
-  return $mp3;
+sub show_downloads {
+  return '';
 }
 
-sub validate_mp3 {
-  my @list;
-  foreach (@_) {
-    chomp();
-    if (/\/(\d+-\w+-\d+\.mp3)$/) { push @list, $_; }
-    else { debug("Bad scheme: $_\n"); }
-  }
-  return @list;
-}
-
-sub update_index {
-  my $fn = "$config{'datadir'}/$config{'index'}";
-
-  # update index
-  #fetch($config{'url'}, $fn);
-  -f $fn or die "Could not find file '$fn'.\n";
-
-  # parse index
-  my $tree = HTML::TreeBuilder::XPath->new;
-  $tree->parse_file($fn);
-
-  # On the front page we want to find the first numeric link under td of @class="btitel" to find out the youngest entry.
-  # xpath: table/tr/td/table/tr/td[@class="btitel"]/a
-  # format: <td WIDTH="*" class="btitel"><a href="/62449">&quot;<DC>ber den eigenen K<F6>rper verf<FC>gen&quot; - Sondersendung zu internationalen Frauenkampftag</a></td>        </tr>
-
-  my $a = $tree->findnodes('//td[@class="btitel"]/a')->[0];
-  unless($a) { die "Could not find latest entry in $config{'index'}.\n"; }
-
-  if ($a->attr('href') =~ /\/(\d+)$/) {
-      $config{'last'} = $1;
-      $tree->delete;
-      return $1;
-  } else { die "update_index(): Bad link format of '". $a->as_trimmed_text .' => '. $a->attr('href') ."'.\n"; }  
+sub finish_download {
+  return shift;
 }
 
 sub start_download {
   my $url = shift || return;
   if ($config{'downloads'}{$url}) { status_line ("already downloading '$url'"); return; };
   unless ($url =~ /^http/) { $url = "$config{'url'}$url"; }
-  my $id = basename($url);
 
   my $fn = shift || return;
+  # avoid parallell downloads
+  debug "Downloading $url..";
 
-  try {
-    # create curl handle
-    my $handle = WWW::Curl::Easy->new;
-    $handle->setopt(CURLOPT_HEADER,1);
-    $handle->setopt(CURLOPT_URL, $url);
-    $handle->setopt(CURLOPT_PRIVATE,$url);
-
-    open my $fh, '>>', $fn or warn "Could not save '$fn': $!\n" and return;
-    $handle->setopt(CURLOPT_WRITEDATA, $fh);
-
-    # add handle to pool
-    unless ($config{'curlm'}) {
-      $config{'curlm'} = WWW::Curl::Multi->new;
-    }
-    $config{'curlm'}->add_handle($handle);
-    $config{'active_downloads'}++;
-
-    # return handle for remote access
-    %{$config{'downloads'}{$url}} = ( id => $id, handle => \$handle, file => $fn );
-
-    status_line ("$url > $fn") if ($self->{'verbose'});
-    status_line();
-    return $url;
-
-  } catch {
-    print "\rCould not start download for '$url': $1\n";
-    return;
+  my $status = system "wget -nv -c -O '$fn' '$url'"; # start download and pause program
+  unless (system ("grep htp://kamps.de/baeckerei $fn > /dev/null") >= 1) { # exit when this line is found.
+    print "Session expired."; unlink $fn; exit(1);
   }
-
-  # TODO Would be great to check the file size before downloading.
-
-    # Why am I using Curl rather then LWP?
-    # I live with a very throttled mobile internet connection and found perl consuming 99% cpu
-    # while loading mp3 files with LWP.
-
-    # Thin was much better regarding CPU than LWP but it broke without clear reason
-    # and restarted several megabyte files from the beginning. So I rather hesitate to implement it.
- 
-    # [LWP] size=342 size=17624626 [Thin] [1] 599 Internal Exception Timed out while waiting for socket
-    # to become ready for reading at /usr/share/perl/5.14/HTTP/Tiny.pm line 162
-
-    # I got a nice html graph with NYTProf showing the connection was restarted *lots* of times internally
-    # and IO::Socket::SSL ate about half of the cpu time:
-    #   spent 128s (101+27.3) within IO::Socket::SSL::_set_rw_error which was called 2181095 times, avg 59µs/call:
-    #    2181091 times (101s+27.3s) by IO::Socket::SSL::generic_read at line 682, avg 59µs/call
-    #   spent 418s (68.9+349) within Net::HTTP::Methods::my_read which was called 2182614 times, avg 192µs/call
-    #   spent 522s (104+418) within Net::HTTP::Methods::read_entity_body which was called 2182616 times, avg 239µs/call
-    # <mst> this comes back to "the internals of LWP are full of crack"
-
-    # from WWW::Curl documentation:
-    #   The standard Perl WWW module, LWP should probably be used in most cases to work with HTTP or FTP from Perl.
-    #   However, there are some cases where LWP doesn't perform well. One is speed and the other is parallelism.
-    #   WWW::Curl is much faster, uses much less CPU cycles and it's capable of non-blocking parallel requests.
-
-}
-
-sub finish_download {
-  my $url = shift||return;
-  my $try = shift||0;
-  my $curl = ${$config{'downloads'}{$url}{'handle'}};
-  return unless $curl;
-  my $retcode = $curl->perform;
-
-  # Looking at the results...
-  if ($retcode == 0) {
-    my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
-    debug "ok[$response_code].\r";
-
-    # letting the curl handle get garbage collected, or we leak memory.
-    delete $config{'downloads'}{$url};
+  unless ($status == 0) {
+    debug "failed, retrying ..\n";
+    return;
+  } {
+    debug " done.\n";
     return 1;
-
-  } else {
-    my $fn = $config{'downloads'}{$url}{'fn'};
-
-    unless ($try >= $config{'retries'}) {
-      debug "$retcode ".$curl->strerror($retcode)." ".$curl->errbuf ." - retrying download.\n";
-      $config{'downloads'}{$url} = undef;
-      start_download($url, $fn);
-    }
-    return;
+#    return $url;
   }
-}
-
-sub show_downloads {
-  my @downloads = keys %{$config{'downloads'}};
-  if (@downloads) {
-    print "\r[". join(' | ', @downloads) ."]\n";
-  }
-}
-
-sub check_downloads { # update our curl transfers
-  # call this regularly to catch all received packets and send responses in time
-  my $max = shift || $config{'max_downloads'};
-  $config{'active_downloads'} ||= 0;
-
-  my $active_transfers = ($config{'curlm'}) ? $config{'curlm'}->perform : 0;
-
-  if ($active_transfers != $config{'active_downloads'}) {
-    while (my ($url,$return_value) = $config{'curlm'}->info_read) {
-      if ($url) {
-	debug "\rFinishing download of '$url'.. ";
-        finish_download($url);
-        $config{'active_downloads'}--;
-        status_line();
-      }      
-    }
-    # fix counting errors
-    $config{'active_downloads'} = $active_transfers if ($active_transfers > $config{'active_downloads'});
-  }
-
-  # the calling function usually wants to know if there are empty slots
-  return ($max > $active_transfers ) ? 1 : 0;
 }
 
 sub status_line {
@@ -406,38 +231,15 @@ sub status_line {
   print "\r[$time] $downloads$entry | $playing";
 }
 
-sub fetch {
-  my ($url, $fn) = @_;
-  defined($url) or die "fetch(): no url supplied.\n";
-
-  my $try = 1;
-  do {
-    debug "[Curl] ";
-    finish_download(start_download($url, $fn), $try) and return 1;
-
-    sleep 1; # give user a chance to cancel when network interface disappeared etc.
-    $try++;
-
-  } while ($try <= $config{'retries'});
-  print "Giving up for '$url'.\n";
-  return;
-}
-
-sub save {
-  my ($fn, @data) = @_;
-  return unless (defined($fn));
-
-  open my $fh, '>', $fn or die "could not write to '$fn': $!\n";
-  print {$fh} @data;
-  close $fh;
-  return 1;
-}
-
 sub parse_entry_html {
   my $file = shift or die "parse(): no or empty filename given\n";
   open my $fh, '<', $file or warn "Could not read '$file': $!\n" and return;
   my @urls;
   my $parser = HTML::TokeParser::Simple->new(handle => $fh);
+
+  unless (system ("grep htp://kamps.de/baeckerei $file > /dev/null") >= 1) { # exit when this line is found.
+    print "Session expired."; unlink $file; exit(1);
+  }
 
   while (my $anchor = $parser->get_tag('a')) {
     next unless defined(my $href = $anchor->get_attr('href'));
@@ -448,17 +250,53 @@ sub parse_entry_html {
   return @urls;
 }
 
-sub noentry {
-  # We save the number of parsed html files in 'noentry' when they contain no entry.
-  # If this file is deleted, all cached html files are reparsed on the next run.
-  # If also the html cache has been deleted, we need to redownload all index files again.
-  # TODO create db file with titles, descriptions and mp3 urls.
-  my $id = shift or warn "failed(): no id given\n" and return;
-  return unless ($id =~ /(\d+)/);
-  open my $fh, '>> noentry' or die "Could not write to 'noentry': $!\n";
-  print {$fh} "$1\n";
-  close $fh;
-  return 1;
+sub update_index {
+  my $fn = "$config{'datadir'}/$config{'index'}";
+
+  # update index
+  debug "updating index.. ";
+  fetch($config{'url'}, $fn);
+  -f $fn or die "Could not find file '$fn'.\n";
+
+  unless (system ("grep http://kamps.de/baeckerei $fn > /dev/null") >= 1) { # exit when this line is found.
+    print "Session expired.\n"; unlink $fn; exit(1);
+  }
+
+  # parse index
+  my $tree = HTML::TreeBuilder::XPath->new;
+  $tree->parse_file($fn);
+
+  # On the front page the youngest entry is in the first numeric link in a div with class="btitel".
+  # xpath: div[@class="btitel"]/a
+  # format: <div class="dlb_bl_text btitel"><a href='/76159'>10.000 warten weiter in Idomeni</a></div>
+
+  my $a = $tree->findnodes('//div[@class="dlb_bl_text btitel"]/a')->[0];
+  unless($a) { die "Could not find latest entry in '$fn'. Maybe the file format has changed. Please check for updates.\n"; }
+
+  if ($a->attr('href') =~ /\/(\d+)$/) {
+      debug "last entry: $1.\n";
+      $config{'last'} = $1;
+      $config{'current_entry'} ||= $config{'last'};
+      $tree->delete;
+      return $1;
+  } else { die "update_index(): Bad link format of '". $a->as_trimmed_text .' => '. $a->attr('href') ."'.\n"; }  
+}
+
+sub fetch {
+  my ($url, $fn) = @_;
+  defined($url) or die "fetch(): no url supplied.\n";
+
+  my $try = 1;
+  do {
+    #debug "[Curl] "; TODO disabled
+    finish_download(start_download($url, $fn), $try) and return 1;
+
+    sleep 1; # give user a chance to cancel when network interface disappeared etc.
+    $try++;
+
+  } while ($try <= $config{'retries'});
+  print "Giving up for '$url'.\n";
+  return;
 }
 
 sub fetch_entry {
@@ -474,7 +312,7 @@ sub fetch_entry {
     } else { warn "\rCould not open '$dir/noentry': $!\n"; }
 
     # refresh index
-    unless ($config{'last'}) { update_index(); }
+    unless ($config{'last'} >0) { update_index(); }
     $config{'current_entry'} ||= $config{'last'};
   }
 
@@ -489,8 +327,7 @@ sub fetch_entry {
   my $htmlfile = "$dir/html/$entry.html";
 
   unless (-f $htmlfile) {
-    check_downloads(3) # OPTIMIZE we allow us to have three in parallel ignoring the user defined limit
-      and start_download("$config{url}/$entry", $htmlfile);
+    check_downloads(1) and start_download("$config{url}/$entry", $htmlfile);
     return;
   }
 
@@ -499,11 +336,10 @@ sub fetch_entry {
     foreach my $url (parse_entry_html($htmlfile)) {
       # TODO check if the file is only partially downloaded
       my $fn = "$dir/mp3/". basename($url);
-      unless (-f $fn) {
-        debug "\rneed to download '$url' ";
-        check_downloads() and start_download($url, $fn);
-        return;
-      }
+      #unless (-f $fn) {
+        check_downloads(1) and start_download($url, $fn);
+      #  return;
+      #}
     }
   }
 
@@ -512,8 +348,22 @@ sub fetch_entry {
   return 1;
 }
 
+sub noentry {
+  # We save the number of parsed html files in the file 'noentry' when they contain no entry.
+  # If it is deleted, all cached html files are reparsed on the next run.
+  # If also the html cache has been deleted, we need to redownload all index files again.
+  # TODO create db file with titles, descriptions and mp3 urls.
+  my $id = shift or warn "failed(): no id given\n" and return;
+  return unless ($id =~ /(\d+)/);
+  open my $fh, '>> noentry' or die "Could not write to 'noentry': $!\n";
+  print {$fh} "$1\n";
+  close $fh;
+  return 1;
+}
+
 sub fetch_entries {
   my $all = shift;
+  unless ($config{'current_entry'} && $config{'current_entry'} >0) { update_index(); }
 
   do { # start downloads
     # start next download when slot is available
