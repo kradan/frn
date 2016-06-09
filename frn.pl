@@ -77,27 +77,34 @@ check_config(); # loads or creates config file
 
 ## main
 
-if (0 && $config{play}) { # TODO disabled
+if ($config{play}) {
 
   #use 'playback.pm';
 
   my $dir = "$config{'datadir'}/mp3";
   die "Could not find '$dir'.\n" unless (-d $dir);
 
-  if ($config{'play'} >=2) { # newest
-    playback( qx{ls -1 --sort time $dir/*.mp3} );
+  my @files = qx{ls -1 --sort time $dir/*.mp3}; 
+  my (%played, $current);
 
-  } else { # play all files in alphabetical order
-    playback( glob("$dir/*.mp3") );
-  }
-  exit;
-} # /play
+  for (my $i=0; $i < @files; $i++) {
+      chomp($current = $files[$i]);
+      next if ($played{$current});
+      $played{$current}++;
+      print "\rPlaying $current ..";
+      play($current); #playback($current);
+    $i++;
+  };
+  print "Nothing more to play. Exiting ..\n";
+  exit 0; # play assumes offline mode
+}
 
-$self->{'offline'} and exit; # exit after playing in offline mode
+#exit 0 if ($self->{'offline'}); # play assumes offline mode
 
 # if called without arguments we download the index and linked info pages
 fetch_entries(1);
 exit 0;
+
 
 ## subs
 
@@ -157,6 +164,15 @@ sub check_config {
     }
   }
   return 1;
+}
+
+sub play {
+  my $mp3 = shift || (warn "\rplay_mp3(): no file given.\n" and return);
+  unless (-f $mp3) { warn "\rplay_mp3(): $mp3: file not found.\n"; return; }
+  if (-s $mp3 == 0) { debug "file is empty: $mp3\n"; unlink $mp3; return; }
+  open $self->{mplayer_fh}, "| mplayer -slave -nofs -nokeepaspect -input nodefault-bindings:conf=/dev/null -zoom -fixed-vo --really-quiet '$mp3' 2>/dev/null"
+    or warn "\rCould not connect to mplayer: $!\n";
+  return;
 }
 
 sub search {
@@ -344,7 +360,8 @@ sub fetch_entry {
   }
 
   # if no download has been started the entry should be complete
-  $config{'current_entry'}--; 
+  $config{'current_entry'}--;
+  sleep 1; # give user a chance to cancel when network interface disappeared etc.
   return 1;
 }
 
