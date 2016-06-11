@@ -316,6 +316,7 @@ sub fetch {
 }
 
 sub fetch_entry {
+  debug "\r$config{'current_entry'}";
   # check dir
   my $dir = $config{'datadir'};
   #-d $dir or die "Could not find '$dir'.\n"; # OPTIMIZE speed
@@ -325,7 +326,7 @@ sub fetch_entry {
     if (open my $missing, '<', "$dir/noentry") { 
       /(\d+)/ && $config{'noentry'}{$1}++ while <$missing>; # thanks to tm604!
       close $missing;
-    } else { warn "\rCould not open '$dir/noentry': $!\n"; }
+    } else { debug "\rCould not open '$dir/noentry': $!\n"; }
 
     # refresh index
     unless ($config{'last'} >0) { update_index(); }
@@ -344,24 +345,24 @@ sub fetch_entry {
 
   unless (-f $htmlfile) {
     check_downloads(1) and start_download("$config{url}/$entry", $htmlfile);
-    return;
+    sleep 1; # give user a chance to cancel when network interface disappeared etc.
+    #return;
   }
-
-  # fetch mp3
-  if ($config{'download_files'}) {
-    foreach my $url (parse_entry_html($htmlfile)) {
-      # TODO check if the file is only partially downloaded
-      my $fn = "$dir/mp3/". basename($url);
-      #unless (-f $fn) {
-        check_downloads(1) and start_download($url, $fn);
-      #  return;
-      #}
+  # fetch mp3, if $htmlfile exists
+  if (-f $htmlfile) {
+    if ($config{'download_files'}) {
+      foreach my $url (parse_entry_html($htmlfile)) {
+        # TODO check if the file is only partially downloaded
+        my $fn = "$dir/mp3/". basename($url);
+        #unless (-f $fn) {
+          check_downloads(1) and start_download($url, $fn);
+        #  return;
+        #}
+        sleep 1; # give user a chance to cancel when network interface disappeared etc.
+      }
     }
+    $config{'current_entry'}--;
   }
-
-  # if no download has been started the entry should be complete
-  $config{'current_entry'}--;
-  sleep 1; # give user a chance to cancel when network interface disappeared etc.
   return 1;
 }
 
